@@ -18,7 +18,10 @@
   .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
   .row label { flex: 0 0 auto; color: #ccc; font-size: 12px; }
   .row input[type=range] { flex: 1 1 auto; }
-  .sizeVal { width: 44px; text-align: right; font-family: monospace; font-size: 12px; color: #9cf; }
+  .row select {
+    background: #2a2a2a; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 3px 6px;
+  }
+  .sizeVal { width: 52px; text-align: right; font-family: monospace; font-size: 12px; color: #9cf; }
   button {
     background: #2a2a2a; color: #eee; border: 1px solid #555; border-radius: 6px;
     padding: 5px 10px; font-size: 12px; cursor: pointer;
@@ -43,11 +46,6 @@
     font-size: 12px; padding: 2px 6px; border-radius: 4px; white-space: nowrap;
     pointer-events: none;
   }
-  #selectionBox {
-    position: absolute; z-index: 12; border: 1px dashed #ff5050;
-    background: rgba(255, 80, 80, 0.15); pointer-events: none; display: none;
-  }
-  #deleteCount { font-size: 12px; color: #ff8080; }
 </style>
 </head>
 <body>
@@ -74,23 +72,23 @@
   <div id="measureList"></div>
   <hr>
   <div class="row">
-    <button id="deleteModeBtn">🗑️ 範囲削除選択: OFF</button>
+    <button id="clipToggleBtn">✂️ 断面カット: OFF</button>
+    <button id="clipFlipBtn">反転</button>
   </div>
-  <div id="deleteHint" style="color:#999; font-size:11px; display:none;">
-    ドラッグで範囲選択(複数回可)。赤い点が削除対象です
+  <div class="row" id="clipAxisRow" style="display:none;">
+    <label>軸</label>
+    <select id="clipAxis">
+      <option value="x">X</option>
+      <option value="y">Y</option>
+      <option value="z">Z (高さ)</option>
+    </select>
   </div>
-  <div class="row" id="deleteRow" style="display:none;">
-    <span id="deleteCount">選択: 0点</span>
-    <button id="deleteConfirmBtn">削除実行</button>
-    <button id="deleteClearBtn">選択解除</button>
-  </div>
-  <div class="row">
-    <button id="resetBtn">↺ 元に戻す</button>
-    <button id="downloadBtn">💾 編集済みPLYを保存</button>
+  <div class="row" id="clipPosRow" style="display:none;">
+    <label>位置</label>
+    <input type="range" id="clipSlider" min="0" max="1000" value="500">
+    <span class="sizeVal" id="clipVal">-</span>
   </div>
 </div>
-
-<div id="selectionBox"></div>
 
 <div id="stats"></div>
 
@@ -120,28 +118,25 @@ const measureBtn = document.getElementById('measureBtn');
 const clearBtn = document.getElementById('clearBtn');
 const measureHint = document.getElementById('measureHint');
 const measureList = document.getElementById('measureList');
-const deleteModeBtn = document.getElementById('deleteModeBtn');
-const deleteHint = document.getElementById('deleteHint');
-const deleteRow = document.getElementById('deleteRow');
-const deleteCount = document.getElementById('deleteCount');
-const deleteConfirmBtn = document.getElementById('deleteConfirmBtn');
-const deleteClearBtn = document.getElementById('deleteClearBtn');
-const resetBtn = document.getElementById('resetBtn');
-const downloadBtn = document.getElementById('downloadBtn');
-const selectionBox = document.getElementById('selectionBox');
+const clipToggleBtn = document.getElementById('clipToggleBtn');
+const clipFlipBtn = document.getElementById('clipFlipBtn');
+const clipAxisRow = document.getElementById('clipAxisRow');
+const clipAxisSelect = document.getElementById('clipAxis');
+const clipPosRow = document.getElementById('clipPosRow');
+const clipSlider = document.getElementById('clipSlider');
+const clipVal = document.getElementById('clipVal');
 
 let scene, camera, renderer, controls, pointCloud, raycaster;
 let sceneScale = 1; // バウンディングスフィア半径。サイズ調整の基準にする
 let measureMode = false;
 let pendingPoint = null;   // 測定中の1点目
 let pendingMarker = null;
+const measurements = []; // {a, b, markerA, markerB, line, label, dist}
 
-let originalBuffer = null;   // リセット用に保持する読み込み直後のArrayBuffer
-let originalLabel = '';
-let deleteMode = false;
-let baseColors = null;       // ハイライト前の元の色 (Float32Array)
-let selectedMask = null;     // Uint8Array: 1 = 削除候補として選択中
-const measurements = [];     // {a, b, markerA, markerB, line, label, dist}
+let clipEnabled = false;
+let clipFlip = false;
+const clipPlane = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+let clipBounds = null; // 現在の点群のバウンディングボックス（センタリング後）
 
 function createCircleTexture() {
   const size = 64;
@@ -168,6 +163,7 @@ function initScene() {
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.localClippingEnabled = true;
   document.getElementById('container').appendChild(renderer.domElement);
 
   controls = new OrbitControls(camera, renderer.domElement);
@@ -183,7 +179,7 @@ function initScene() {
   });
 
   setupMeasurement();
-  setupDeleteSelection();
+  setupClipping();
   animate();
 }
 
@@ -194,16 +190,9 @@ function animate() {
   updateAllLabels();
 }
 
-function loadPlyArrayBuffer(arrayBuffer, label, keepAsOriginal = true) {
-  if (keepAsOriginal) {
-    originalBuffer = arrayBuffer.slice(0);
-    originalLabel = label;
-  }
-
+function loadPlyArrayBuffer(arrayBuffer, label) {
   const loader = new PLYLoader();
   const geometry = loader.parse(arrayBuffer);
-  geometry.computeBoundingBox();
-  geometry.computeBoundingSphere();
 
   if (pointCloud) {
     scene.remove(pointCloud);
@@ -211,39 +200,34 @@ function loadPlyArrayBuffer(arrayBuffer, label, keepAsOriginal = true) {
     pointCloud.material.dispose();
   }
   clearMeasurements();
-  exitDeleteMode();
 
   const hasColor = !!geometry.getAttribute('color');
   const material = new THREE.PointsMaterial({
     sizeAttenuation: true,
-    vertexColors: true,
+    vertexColors: hasColor,
+    color: hasColor ? 0xffffff : 0xb4b4b4,
     map: circleTexture,
     alphaTest: 0.4,
     transparent: false,
+    clippingPlanes: [],
   });
 
   // PLYLoaderは0-255のuint8色を0-1に正規化しないことがあるため補正
-  // 色情報が無いPLYの場合は選択ハイライト用に一様なグレーの色属性を作る
   const colorAttr = geometry.getAttribute('color');
-  const posCount = geometry.getAttribute('position').count;
   if (colorAttr && colorAttr.array instanceof Uint8Array) {
     const normalized = new Float32Array(colorAttr.array.length);
     for (let i = 0; i < colorAttr.array.length; i++) {
       normalized[i] = colorAttr.array[i] / 255;
     }
     geometry.setAttribute('color', new THREE.BufferAttribute(normalized, 3));
-  } else if (!hasColor) {
-    const gray = new Float32Array(posCount * 3).fill(0.706);
-    geometry.setAttribute('color', new THREE.BufferAttribute(gray, 3));
   }
-
-  baseColors = geometry.getAttribute('color').array.slice(0);
-  selectedMask = new Uint8Array(posCount);
 
   pointCloud = new THREE.Points(geometry, material);
 
   // 中心をシーン原点へ、カメラをバウンディングスフィアに合わせて配置
   geometry.center();
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
 
   const sphere = geometry.boundingSphere;
   sceneScale = sphere ? sphere.radius : 5;
@@ -261,10 +245,13 @@ function loadPlyArrayBuffer(arrayBuffer, label, keepAsOriginal = true) {
   sizeSlider.value = 30;
   applyPointSize();
 
+  // 断面カットの基準となるバウンディングボックスをリセット
+  clipBounds = geometry.boundingBox.clone();
+  resetClipping();
+
   const count = geometry.getAttribute('position').count;
   pointInfo.textContent = `${label}: ${count.toLocaleString()} 点`;
   statsEl.textContent = `points: ${count.toLocaleString()}`;
-  updateDeleteCountUI();
 }
 
 function applyPointSize() {
@@ -295,7 +282,6 @@ async function loadInitial() {
 // ------------------------------------------------------------------
 function setupMeasurement() {
   measureBtn.addEventListener('click', () => {
-    if (!measureMode && deleteMode) exitDeleteMode(); // 削除選択モードとは排他
     measureMode = !measureMode;
     measureBtn.textContent = `📏 距離測定: ${measureMode ? 'ON' : 'OFF'}`;
     measureBtn.classList.toggle('active', measureMode);
@@ -415,225 +401,57 @@ function updateAllLabels() {
 }
 
 // ------------------------------------------------------------------
-// 範囲削除選択機能（ドラッグで矩形選択→赤くハイライト→削除実行）
+// 断面カット機能（軸に沿ったクリッピング平面で点群を切断表示）
 // ------------------------------------------------------------------
-function setupDeleteSelection() {
-  deleteModeBtn.addEventListener('click', () => {
-    if (deleteMode) {
-      exitDeleteMode();
-    } else {
-      if (measureMode) { measureBtn.click(); } // 測定モードとは排他
-      deleteMode = true;
-      deleteModeBtn.textContent = '🗑️ 範囲削除選択: ON';
-      deleteModeBtn.classList.add('active');
-      deleteHint.style.display = 'block';
-      controls.enabled = false;
-    }
+function setupClipping() {
+  clipToggleBtn.addEventListener('click', () => {
+    clipEnabled = !clipEnabled;
+    clipToggleBtn.textContent = `✂️ 断面カット: ${clipEnabled ? 'ON' : 'OFF'}`;
+    clipToggleBtn.classList.toggle('active', clipEnabled);
+    clipAxisRow.style.display = clipEnabled ? 'flex' : 'none';
+    clipPosRow.style.display = clipEnabled ? 'flex' : 'none';
+    updateClipPlane();
   });
 
-  deleteConfirmBtn.addEventListener('click', commitDeletion);
-  deleteClearBtn.addEventListener('click', clearSelection);
-  resetBtn.addEventListener('click', resetToOriginal);
-  downloadBtn.addEventListener('click', downloadEditedPly);
-
-  let dragStart = null;
-  const dom = renderer.domElement;
-
-  dom.addEventListener('pointerdown', (e) => {
-    if (!deleteMode) return;
-    dragStart = { x: e.clientX, y: e.clientY };
-    selectionBox.style.left = e.clientX + 'px';
-    selectionBox.style.top = e.clientY + 'px';
-    selectionBox.style.width = '0px';
-    selectionBox.style.height = '0px';
-    selectionBox.style.display = 'block';
+  clipFlipBtn.addEventListener('click', () => {
+    clipFlip = !clipFlip;
+    updateClipPlane();
   });
 
-  window.addEventListener('pointermove', (e) => {
-    if (!deleteMode || !dragStart) return;
-    const x0 = Math.min(dragStart.x, e.clientX);
-    const y0 = Math.min(dragStart.y, e.clientY);
-    const w = Math.abs(e.clientX - dragStart.x);
-    const h = Math.abs(e.clientY - dragStart.y);
-    selectionBox.style.left = x0 + 'px';
-    selectionBox.style.top = y0 + 'px';
-    selectionBox.style.width = w + 'px';
-    selectionBox.style.height = h + 'px';
-  });
-
-  window.addEventListener('pointerup', (e) => {
-    if (!deleteMode || !dragStart) return;
-    const x0 = Math.min(dragStart.x, e.clientX);
-    const y0 = Math.min(dragStart.y, e.clientY);
-    const x1 = Math.max(dragStart.x, e.clientX);
-    const y1 = Math.max(dragStart.y, e.clientY);
-    dragStart = null;
-    selectionBox.style.display = 'none';
-    if (Math.abs(x1 - x0) < 3 || Math.abs(y1 - y0) < 3) return; // 誤クリック防止
-    selectPointsInRect(x0, y0, x1, y1);
-  });
+  clipAxisSelect.addEventListener('change', updateClipPlane);
+  clipSlider.addEventListener('input', updateClipPlane);
 }
 
-function selectPointsInRect(x0, y0, x1, y1) {
-  if (!pointCloud) return;
-  const ndcX0 = (x0 / window.innerWidth) * 2 - 1;
-  const ndcX1 = (x1 / window.innerWidth) * 2 - 1;
-  const ndcY0 = -(y0 / window.innerHeight) * 2 + 1; // 上端 → 大きいNDC-y
-  const ndcY1 = -(y1 / window.innerHeight) * 2 + 1; // 下端 → 小さいNDC-y
-  const xMin = Math.min(ndcX0, ndcX1), xMax = Math.max(ndcX0, ndcX1);
-  const yMin = Math.min(ndcY0, ndcY1), yMax = Math.max(ndcY0, ndcY1);
-
-  const viewProj = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-  const pos = pointCloud.geometry.getAttribute('position').array;
-  const n = pointCloud.geometry.getAttribute('position').count;
-  const v = new THREE.Vector3();
-  let newlySelected = 0;
-
-  for (let i = 0; i < n; i++) {
-    if (selectedMask[i]) continue;
-    v.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]);
-    v.applyMatrix4(viewProj);
-    if (v.z > 1 || v.z < -1) continue; // カメラ視錐台の外（背後含む）
-    if (v.x >= xMin && v.x <= xMax && v.y >= yMin && v.y <= yMax) {
-      selectedMask[i] = 1;
-      newlySelected++;
-    }
-  }
-
-  if (newlySelected > 0) applyHighlight();
-  updateDeleteCountUI();
+function resetClipping() {
+  clipEnabled = false;
+  clipFlip = false;
+  clipToggleBtn.textContent = '✂️ 断面カット: OFF';
+  clipToggleBtn.classList.remove('active');
+  clipAxisRow.style.display = 'none';
+  clipPosRow.style.display = 'none';
+  clipAxisSelect.value = 'x';
+  clipSlider.value = 500;
+  updateClipPlane();
 }
 
-function applyHighlight() {
-  const colorAttr = pointCloud.geometry.getAttribute('color');
-  const arr = colorAttr.array;
-  const n = selectedMask.length;
-  for (let i = 0; i < n; i++) {
-    if (selectedMask[i]) {
-      arr[i * 3] = 1.0; arr[i * 3 + 1] = 0.1; arr[i * 3 + 2] = 0.1;
-    } else {
-      arr[i * 3] = baseColors[i * 3];
-      arr[i * 3 + 1] = baseColors[i * 3 + 1];
-      arr[i * 3 + 2] = baseColors[i * 3 + 2];
-    }
-  }
-  colorAttr.needsUpdate = true;
-}
+function updateClipPlane() {
+  if (!pointCloud || !clipBounds) return;
+  const axis = clipAxisSelect.value;
+  const min = clipBounds.min[axis];
+  const max = clipBounds.max[axis];
+  const t = clipSlider.value / 1000;
+  const pos = min + t * (max - min);
 
-function updateDeleteCountUI() {
-  const n = selectedMask ? selectedMask.reduce((a, b) => a + b, 0) : 0;
-  deleteCount.textContent = `選択: ${n.toLocaleString()}点`;
-  deleteRow.style.display = deleteMode ? 'flex' : 'none';
-  deleteConfirmBtn.disabled = n === 0;
-}
+  const sign = clipFlip ? -1 : 1;
+  clipPlane.normal.set(
+    axis === 'x' ? sign : 0,
+    axis === 'y' ? sign : 0,
+    axis === 'z' ? sign : 0
+  );
+  clipPlane.constant = -sign * pos;
 
-function clearSelection() {
-  if (!selectedMask) return;
-  selectedMask.fill(0);
-  if (pointCloud) applyHighlight();
-  updateDeleteCountUI();
-}
-
-function commitDeletion() {
-  if (!pointCloud || !selectedMask) return;
-  const totalSelected = selectedMask.reduce((a, b) => a + b, 0);
-  if (totalSelected === 0) return;
-  if (!confirm(`${totalSelected.toLocaleString()}点を削除します。よろしいですか？`)) return;
-
-  const geometry = pointCloud.geometry;
-  const posAttr = geometry.getAttribute('position');
-  const oldN = posAttr.count;
-  const newN = oldN - totalSelected;
-
-  const newPos = new Float32Array(newN * 3);
-  const newColor = new Float32Array(newN * 3);
-  const newBase = new Float32Array(newN * 3);
-  let j = 0;
-  for (let i = 0; i < oldN; i++) {
-    if (selectedMask[i]) continue;
-    newPos[j * 3] = posAttr.array[i * 3];
-    newPos[j * 3 + 1] = posAttr.array[i * 3 + 1];
-    newPos[j * 3 + 2] = posAttr.array[i * 3 + 2];
-    newColor[j * 3] = baseColors[i * 3];
-    newColor[j * 3 + 1] = baseColors[i * 3 + 1];
-    newColor[j * 3 + 2] = baseColors[i * 3 + 2];
-    newBase[j * 3] = baseColors[i * 3];
-    newBase[j * 3 + 1] = baseColors[i * 3 + 1];
-    newBase[j * 3 + 2] = baseColors[i * 3 + 2];
-    j++;
-  }
-
-  geometry.setAttribute('position', new THREE.BufferAttribute(newPos, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(newColor, 3));
-  geometry.computeBoundingBox();
-  geometry.computeBoundingSphere();
-
-  baseColors = newBase;
-  selectedMask = new Uint8Array(newN);
-
-  pointInfo.textContent = `${originalLabel} (編集済み): ${newN.toLocaleString()} 点`;
-  statsEl.textContent = `points: ${newN.toLocaleString()}`;
-  updateDeleteCountUI();
-}
-
-function exitDeleteMode() {
-  deleteMode = false;
-  deleteModeBtn.textContent = '🗑️ 範囲削除選択: OFF';
-  deleteModeBtn.classList.remove('active');
-  deleteHint.style.display = 'none';
-  deleteRow.style.display = 'none';
-  selectionBox.style.display = 'none';
-  if (controls) controls.enabled = true;
-}
-
-function resetToOriginal() {
-  if (!originalBuffer) return;
-  if (!confirm('編集内容を破棄して、最初に読み込んだ点群に戻します。よろしいですか？')) return;
-  loadPlyArrayBuffer(originalBuffer.slice(0), originalLabel, false);
-}
-
-function downloadEditedPly() {
-  if (!pointCloud) return;
-  const geometry = pointCloud.geometry;
-  const posAttr = geometry.getAttribute('position');
-  const colorAttr = geometry.getAttribute('color');
-  const n = posAttr.count;
-
-  const header =
-    'ply\n' +
-    'format binary_little_endian 1.0\n' +
-    `element vertex ${n}\n` +
-    'property float x\n' +
-    'property float y\n' +
-    'property float z\n' +
-    'property uchar red\n' +
-    'property uchar green\n' +
-    'property uchar blue\n' +
-    'end_header\n';
-  const headerBytes = new TextEncoder().encode(header);
-
-  const recordSize = 12 + 3; // xyz(float32)*3 + rgb(uint8)*3
-  const body = new ArrayBuffer(n * recordSize);
-  const view = new DataView(body);
-  for (let i = 0; i < n; i++) {
-    const off = i * recordSize;
-    view.setFloat32(off, posAttr.array[i * 3], true);
-    view.setFloat32(off + 4, posAttr.array[i * 3 + 1], true);
-    view.setFloat32(off + 8, posAttr.array[i * 3 + 2], true);
-    view.setUint8(off + 12, Math.round(Math.min(1, Math.max(0, colorAttr.array[i * 3])) * 255));
-    view.setUint8(off + 13, Math.round(Math.min(1, Math.max(0, colorAttr.array[i * 3 + 1])) * 255));
-    view.setUint8(off + 14, Math.round(Math.min(1, Math.max(0, colorAttr.array[i * 3 + 2])) * 255));
-  }
-
-  const blob = new Blob([headerBytes, body], { type: 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'edited_higashiikuta.ply';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  pointCloud.material.clippingPlanes = clipEnabled ? [clipPlane] : [];
+  clipVal.textContent = pos.toFixed(2) + 'm';
 }
 
 initScene();
